@@ -26,3 +26,13 @@ class MergeFailedError(StorageError):
 
 class NotFoundError(StorageError):
     status_code = 404
+
+
+class JointUploadError(StorageError):
+    """A joint multi-station upload could not be written or published atomically.
+
+    No station of the failed group is ever left visible; the whole group is
+    rolled back and the client may retry by uploading again.
+    """
+
+    status_code = 500

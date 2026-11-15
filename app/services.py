@@ -20,7 +20,10 @@ Concurrency design (single container, in-process guarantees backed by SQLite):
 """
 from __future__ import annotations
 
+import csv
+import io
 import json
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -31,10 +34,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from . import db
-from .errors import MergeConflictError, MergeFailedError, NotFoundError
+from .errors import CsvValidationError, JointUploadError, MergeConflictError, MergeFailedError, NotFoundError
 from .ingestion import (
+    COLUMN_ALIASES,
+    JOINT_MAX_STATIONS,
+    JOINT_MIN_STATIONS,
     hash_tables,
     parse_csv,
+    parse_joint_csv,
     table_to_records,
     validate_day,
     validate_station_id,
@@ -92,6 +99,203 @@ def upload_csv(
         "status": "published",
         "is_merged": False,
     }
+
+
+# ------------------------------------------------------------- joint upload
+def _publish_joint_group(conn: sqlite3.Connection, group_id: str, expected: int) -> None:
+    """Flip every pending row of a joint group to published in one statement.
+
+    Kept as a separate function so tests can simulate a publication failure.
+    """
+    cur = conn.execute(
+        "UPDATE batches SET status = 'published' "
+        "WHERE group_id = ? AND status = 'pending'",
+        (group_id,),
+    )
+    if cur.rowcount != expected:
+        raise JointUploadError(
+            f"expected {expected} pending rows, published {cur.rowcount}"
+        )
+    conn.execute(
+        "UPDATE upload_groups SET status = 'published', "
+        "published_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+        "WHERE group_id = ?",
+        (group_id,),
+    )
+
+
+def _rollback_joint(group_id: str, fm: FileManager) -> None:
+    """Remove every trace of a joint group that did not reach publication."""
+    conn = db.connect()
+    try:
+        rows = conn.execute(
+            "SELECT file_path FROM batches WHERE group_id = ?", (group_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        if row["file_path"]:
+            Path(row["file_path"]).unlink(missing_ok=True)
+    with db.transaction() as tx:
+        tx.execute("DELETE FROM batches WHERE group_id = ?", (group_id,))
+        tx.execute(
+            "UPDATE upload_groups SET status = 'failed' WHERE group_id = ?",
+            (group_id,),
+        )
+
+
+def upload_joint_csv(
+    day: str,
+    content: bytes,
+    fm: FileManager = file_manager,
+) -> dict:
+    """Atomically ingest one joint CSV covering 2-10 stations of one UTC day.
+
+    Two-phase publication:
+
+    1. **write phase** – every station gets its own Parquet file plus a
+       ``pending`` metadata row. Pending rows are invisible to queries,
+       listings and merges, and the per-file writes never take global locks,
+       so ordinary uploads/queries/merges keep running.
+    2. **publish phase** – a single ``BEGIN IMMEDIATE`` transaction flips all
+       rows of the group to ``published`` at once. Before the commit the whole
+       group is invisible; afterwards every station is queryable together.
+
+    Any failure, or a process restart during the write phase, leaves no
+    station published: the transaction is rolled back, the files are unlinked
+    and the client can simply upload again.
+    """
+    validate_day(day)
+    group_id = _new_batch_id("J")
+
+    # First pass: read the CSV to learn the distinct station set. The parser
+    # below repeats the validation but also enforces 2-10 stations and that
+    # every station has >= 1 row before anything touches disk.
+    probe = _distinct_stations(content)
+    batch_ids = {station: _new_batch_id("B") for station in probe}
+    tables = parse_joint_csv(content, day, batch_ids)  # fully validated here
+
+    try:
+        # Persist the group header and all pending rows up front: if the
+        # process dies mid-write, startup recovery finds the whole group via
+        # upload_groups/batches.group_id and discards it as one unit.
+        with db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO upload_groups (group_id, day, station_cnt, status) "
+                "VALUES (?, ?, ?, 'pending')",
+                (group_id, day, len(tables)),
+            )
+            for station, batch_id in batch_ids.items():
+                conn.execute(
+                    "INSERT INTO batches "
+                    "(batch_id, station_id, day, file_path, row_count, size_bytes, "
+                    " content_sha256, status, is_merged, group_id) "
+                    "VALUES (?, ?, ?, '', 0, 0, '', 'pending', 0, ?)",
+                    (batch_id, station, day, group_id),
+                )
+
+        # Per-station files, written independently (no global metadata lock).
+        # Each file is atomically renamed into its final location but stays
+        # unqueryable until the publish transaction flips its status.
+        for station, table in tables.items():
+            batch_id = batch_ids[station]
+            path, row_count, size_bytes = fm.write_parquet_atomic(
+                table, station, day, batch_id
+            )
+            digest = hash_tables([table])
+            with db.transaction() as conn:
+                conn.execute(
+                    "UPDATE batches SET file_path = ?, row_count = ?, size_bytes = ?, "
+                    "content_sha256 = ? WHERE batch_id = ? AND status = 'pending'",
+                    (str(path), row_count, size_bytes, digest, batch_id),
+                )
+
+        # Single atomic publication point for the whole group.
+        with db.transaction() as conn:
+            _publish_joint_group(conn, group_id, len(tables))
+    except Exception as exc:
+        _rollback_joint(group_id, fm)
+        if isinstance(exc, JointUploadError):
+            raise
+        raise JointUploadError(
+            f"joint upload {group_id} rolled back, no station was published: {exc}"
+        ) from exc
+
+    stations_out = []
+    for station, table in tables.items():
+        batch_id = batch_ids[station]
+        path = fm.target_path(station, day, batch_id)
+        stations_out.append(
+            {
+                "station_id": station,
+                "batch_id": batch_id,
+                "day": day,
+                "row_count": table.num_rows,
+                "size_bytes": path.stat().st_size,
+                "content_sha256": hash_tables([table]),
+                "status": "published",
+                "is_merged": False,
+            }
+        )
+    return {
+        "group_id": group_id,
+        "day": day,
+        "station_count": len(stations_out),
+        "stations": stations_out,
+    }
+
+
+def _distinct_stations(content: bytes) -> list[str]:
+    """Read only the station column to size the joint group before parsing.
+
+    Enforces the 2-10 distinct-station rule and station-id syntax without
+    touching the time/rain columns (those are fully validated afterwards by
+    :func:`parse_joint_csv`).
+    """
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise CsvValidationError("CSV must be UTF-8 encoded") from exc
+
+    reader = csv.reader(io.StringIO(text))
+    try:
+        header = next(reader)
+    except StopIteration as exc:
+        raise CsvValidationError("empty CSV: header row required") from exc
+
+    normalized = [re.sub(r"[\s_\-]+", "", h.strip().lower()) for h in header]
+    aliased = [COLUMN_ALIASES.get(h) for h in normalized]
+    if "station_id" not in aliased:
+        raise CsvValidationError(
+            f"CSV must contain a station column; got header {header!r}"
+        )
+    station_idx = aliased.index("station_id")
+
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for line_no, row in enumerate(reader, start=2):
+        if not row or all(not cell.strip() for cell in row):
+            continue
+        if len(row) < len(header):
+            raise CsvValidationError(
+                f"line {line_no}: expected {len(header)} columns, got {len(row)}"
+            )
+        station = row[station_idx].strip()
+        validate_station_id(station)
+        if station not in seen_set:
+            seen_set.add(station)
+            seen.append(station)
+            if len(seen) > JOINT_MAX_STATIONS:
+                raise CsvValidationError(
+                    f"joint CSV accepts at most {JOINT_MAX_STATIONS} distinct stations, "
+                    f"found extra station {station!r}"
+                )
+    if len(seen) < JOINT_MIN_STATIONS:
+        raise CsvValidationError(
+            f"joint CSV must contain at least {JOINT_MIN_STATIONS} distinct stations, "
+            f"found {len(seen)}: {seen!r}"
+        )
+    return seen
 
 
 # ---------------------------------------------------------------------- query
@@ -313,7 +517,8 @@ def list_batches(station_id: str, day: str) -> dict:
         rows = conn.execute(
             "SELECT batch_id, file_path, row_count, size_bytes, status, is_merged, "
             "source_batches, created_at FROM batches "
-            "WHERE station_id = ? AND day = ? ORDER BY created_at ASC, rowid ASC",
+            "WHERE station_id = ? AND day = ? AND status != 'pending' "
+            "ORDER BY created_at ASC, rowid ASC",
             (station_id, day),
         ).fetchall()
     finally:

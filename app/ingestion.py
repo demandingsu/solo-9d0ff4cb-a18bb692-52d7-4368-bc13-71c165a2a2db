@@ -217,6 +217,112 @@ def parse_csv(
     return table, digest
 
 
+# Joint uploads accept between these many distinct stations per CSV.
+JOINT_MIN_STATIONS = 2
+JOINT_MAX_STATIONS = 10
+
+
+def parse_joint_csv(
+    content: bytes,
+    day: str,
+    batch_ids: dict[str, str],
+) -> dict[str, pa.Table]:
+    """Parse and validate one joint CSV covering several stations of one UTC day.
+
+    Same time/rain rules as :func:`parse_csv`, but station ids come from the
+    rows themselves (there is no single URL station). Every distinct station
+    must appear in ``batch_ids`` and contribute at least one row; overall the
+    CSV must contain between ``JOINT_MIN_STATIONS`` and ``JOINT_MAX_STATIONS``
+    distinct stations. Nothing is written to disk here: malformed input leaves
+    no state behind. Returns ``{station_id: arrow_table}`` in first-seen order.
+    """
+    validate_day(day)
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise CsvValidationError("CSV must be UTF-8 encoded") from exc
+
+    reader = csv.reader(io.StringIO(text))
+    try:
+        header = next(reader)
+    except StopIteration as exc:
+        raise CsvValidationError("empty CSV: header row required") from exc
+
+    normalized = [_normalize_header(h) for h in header]
+    aliased = [COLUMN_ALIASES.get(h) for h in normalized]
+    if "station_id" not in aliased or "obs_time" not in aliased or "rain_mm" not in aliased:
+        raise CsvValidationError(
+            "CSV must contain station, timestamp and rainfall columns; "
+            f"got header {header!r}"
+        )
+    idx = {
+        col: aliased.index(col) for col in ("station_id", "obs_time", "rain_mm")
+    }
+
+    grouped: dict[str, dict[str, list]] = {}
+    order: list[str] = []
+    total_rows = 0
+    for line_no, row in enumerate(reader, start=2):
+        if not row or all(not cell.strip() for cell in row):
+            continue  # tolerate blank lines
+        if len(row) < len(header):
+            raise CsvValidationError(
+                f"line {line_no}: expected {len(header)} columns, got {len(row)}"
+            )
+        row_station = row[idx["station_id"]].strip()
+        validate_station_id(row_station)
+        if row_station not in batch_ids:
+            raise CsvValidationError(
+                f"line {line_no}: station_id {row_station!r} is not part of this "
+                f"joint upload group {sorted(batch_ids)!r}"
+            )
+        dt = _parse_timestamp(row[idx["obs_time"]], line_no)
+        if dt.date().isoformat() != day:
+            raise CsvValidationError(
+                f"line {line_no}: timestamp {dt.isoformat()} is not within UTC day {day}"
+            )
+        rain = _parse_rain(row[idx["rain_mm"]], line_no)
+        if row_station not in grouped:
+            validate_station_id(row_station)
+            grouped[row_station] = {"stations": [], "times": [], "rains": []}
+            order.append(row_station)
+        bucket = grouped[row_station]
+        bucket["stations"].append(row_station)
+        bucket["times"].append(dt)
+        bucket["rains"].append(rain)
+        total_rows += 1
+
+    if total_rows == 0:
+        raise CsvValidationError("CSV contains no data rows")
+
+    stations = set(grouped)
+    if not (JOINT_MIN_STATIONS <= len(stations) <= JOINT_MAX_STATIONS):
+        raise CsvValidationError(
+            f"joint CSV must contain {JOINT_MIN_STATIONS}-{JOINT_MAX_STATIONS} distinct "
+            f"stations, found {len(stations)}: {sorted(stations)!r}"
+        )
+    missing = [s for s in batch_ids if s not in grouped]
+    if missing:
+        raise CsvValidationError(
+            f"every station needs at least one row; missing data for {sorted(missing)!r}"
+        )
+
+    tables: dict[str, pa.Table] = {}
+    for station in order:
+        bucket = grouped[station]
+        n = len(bucket["stations"])
+        tables[station] = pa.Table.from_pydict(
+            {
+                "station_id": bucket["stations"],
+                "obs_time": bucket["times"],
+                "rain_mm": bucket["rains"],
+                "source_batch_id": [batch_ids[station]] * n,
+            },
+            schema=SCHEMA,
+        )
+    return tables
+
+
 def table_to_records(table: pa.Table) -> list[dict]:
     """Convert a result table into JSON-friendly records."""
     records: list[dict] = []

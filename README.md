@@ -6,7 +6,8 @@
 - **Web 框架**：FastAPI（同步端点，跑在 threadpool 上，避免阻塞事件循环）
 - **列存文件**：PyArrow / Parquet（zstd 压缩，UTC 毫秒时间戳）
 - **元数据**：SQLite（WAL 模式，`BEGIN IMMEDIATE` 事务 + 进程内写锁）
-- **交付**：可直接启动的 Docker Compose、本地样例 CSV、一键演示脚本、13 个测试
+- **多站联合上传**：一份 CSV 覆盖同一 UTC 日 2–10 个站，两阶段（写盘 → 一次发布）原子入湖
+- **交付**：可直接启动的 Docker Compose、本地样例 CSV、联合上传与中断恢复演示、27 个测试
 
 ## 目录结构
 
@@ -16,12 +17,14 @@ app/
   db.py          SQLite 连接、WAL/忙等待、串行化写事务、表结构
   errors.py      领域异常 -> HTTP 状态码映射
   ingestion.py   CSV 解析/校验、规范 Parquet schema、记录去留（不去重、不排序）
-  storage.py     Parquet 原子写、查询快照与引用计数、后台清理、崩溃恢复扫描
-  services.py    上传 / 查询 / 合并 / 列表 的事务编排
+  storage.py     Parquet 原子写、查询快照与引用计数、后台清理、崩溃恢复扫描（含中断的联合上传组）
+  services.py    单站上传 / 联合上传（两阶段发布）/ 查询 / 合并 / 列表 的事务编排
   main.py        FastAPI 路由与生命周期
-samples/         本地雨量 CSV 样例（含中文表头样例与故意保留的重复行）
+samples/         本地雨量 CSV 样例（含中文表头样例、多站联合样例与故意保留的重复行）
 tests/           端到端与并发测试（pytest + TestClient + 线程池）
-demo.sh          对运行中的服务执行 上传→查询→合并→冲突→清理 全流程
+demo.sh          对运行中的服务执行 上传→查询→合并→冲突→清理 全流程（单站）
+demo_joint.sh    联合上传 HTTP 演示（校验、原子发布、合并互不吞批、单站入口并存）
+demo_recovery.py 联合上传写盘中途“进程重启”的中断恢复本地演示（驱动同一 service 层）
 Dockerfile
 docker-compose.yml
 ```
@@ -51,8 +54,18 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 先启动服务，然后：
 
 ```bash
-./demo.sh                                 # 默认 http://127.0.0.1:8000
+./demo.sh                                 # 单站全流程（默认 http://127.0.0.1:8000）
 RAIN_BASE_URL=http://其它主机:8000 ./demo.sh
+
+./demo_joint.sh                           # 多站联合上传 HTTP 演示
+RAIN_BASE_URL=http://其它主机:8000 ./demo_joint.sh
+```
+
+联合上传**写盘中途进程重启**的中断恢复演示不依赖杀进程，直接驱动与 API
+相同的 service 层、在独立数据目录里模拟崩溃并重新执行启动扫描：
+
+```bash
+python3 demo_recovery.py                  # 可重复运行；RAIN_DEMO_DIR 可指定数据目录
 ```
 
 ### 跑测试
@@ -66,10 +79,11 @@ pytest -q
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/stations/{station_id}/days/{day}/batches` | 上传单站单日 CSV（multipart `file`），作为独立批次保留，返回 `201` |
+| `POST` | `/stations/{station_id}/days/{day}/batches` | 上传单站单日 CSV（multipart `file`），作为独立批次保留，返回 `201`（原有入口，保持可用） |
+| `POST` | `/days/{day}/joint-batches` | **联合上传**：一份 CSV 含同一 UTC 日 2–10 个站号、每站至少一行；各站分别存 Parquet，全部就绪后一次发布，返回每组各站批次号 |
 | `GET`  | `/stations/{station_id}/days/{day}/records` | **实际读取已发布 Parquet 文件**，返回全部记录与所用批次清单 |
 | `POST` | `/stations/{station_id}/days/{day}/merge` | 把当前已发布的小批次原子合并为一个 Parquet 文件 |
-| `GET`  | `/stations/{station_id}/days/{day}/batches` | 列出该站日全部批次（含 `published` / `superseded` 与文件是否还在） |
+| `GET`  | `/stations/{station_id}/days/{day}/batches` | 列出该站日全部批次（含 `published` / `superseded` 与文件是否还在；发布前的 `pending` 批次不可见） |
 | `POST` | `/admin/reap` | 立即清理无查询引用的旧文件（后台线程默认每 5 秒自动执行） |
 | `GET`  | `/health` | 健康检查 |
 
@@ -81,7 +95,8 @@ pytest -q
 表头支持中英文别名，例如 `station_id,obs_time,rain_mm` 或
 `站号,观测时间,雨量毫米`。要求：
 
-- 每行站号与 URL 站号一致；
+- 单站入口：每行站号与 URL 站号一致；联合入口：站号取自各行，需覆盖
+  2–10 个不同站号且每个站号至少一行；
 - 时间为 UTC，且必须落在 URL 指定的 UTC 日期内；
 - 雨量为有限非负数值（毫米）；
 - **完全保留重复行与原始顺序**，不做去重。
@@ -89,8 +104,13 @@ pytest -q
 ### curl 示例
 
 ```bash
+# 单站上传（原有入口）
 curl -X POST -F "file=@samples/st001_2026-11-12_batch1.csv" \
   http://localhost:8000/stations/ST001/days/2026-11-12/batches
+
+# 多站联合上传：一份 CSV，2-10 个站，一次发布
+curl -X POST -F "file=@samples/joint_st001_st002_st003_2026-11-12.csv" \
+  http://localhost:8000/days/2026-11-12/joint-batches
 
 curl http://localhost:8000/stations/ST001/days/2026-11-12/records
 
@@ -119,12 +139,42 @@ curl -X POST http://localhost:8000/stations/ST001/days/2026-11-12/merge
    任一步失败即回滚并删除半成品；半成品没有元数据行，永远不会出现在查询快照中。
    进程崩溃后重启时 `startup_sweep` 清理临时文件、无元数据的孤儿 Parquet 与残留锁。
 
+## 多站联合上传的原子性设计（`POST /days/{day}/joint-batches`）
+
+联合上传把“同一 UTC 日多站的一份联合观测”作为**一个不可分割的组**入湖，
+对应新增的 `upload_groups` 表和 `batches.group_id` / `batches.status='pending'`。
+
+1. **先整份校验再碰盘**：CSV 必须含 2–10 个不同站号、每站至少一行，并沿用
+   单站入口的全部时间（UTC、落在当日）与雨量（有限非负）校验。任何校验失败
+   都在写盘前返回 `400`，不留任何状态。
+2. **写盘阶段各站独立、全程不可见**：先在一个事务里写入组头和每站的
+   `pending` 批次行，再逐站把各自的 Parquet 原子 `os.replace` 到最终路径。
+   `pending` 行不会被查询快照、批次列表或合并选中，因此发布前整批对
+   查询与合并均不可见；写盘不持有全局锁，原有单站上传、查询、合并照常进行。
+3. **一次发布**：所有文件就绪后，单个 `BEGIN IMMEDIATE` 事务把该组所有
+   `pending` 行一次性翻成 `published`（并核对行数），提交前没有任何站可见，
+   提交后各站记录立即可查。
+4. **发布前启动的合并不吞新批**：合并只选取当时 `status='published'` 的固定
+   源集合；`pending` 联合批次不在其中，合并事务也不会 supersede 它们。联合
+   批次在合并之后仍以独立 published 文件存在（测试
+   `test_merge_started_before_publication_does_not_swallow_new_group` 覆盖）。
+5. **失败全有或全无**：任一写盘或发布失败都会回滚——删除已写文件、删除该组
+   全部批次行并把组标记为 `failed`，不可能出现“部分站已发布”。失败后可直接
+   重新上传同一份 CSV。
+6. **写盘中途进程重启可恢复**：重启时 `startup_sweep` 找到所有 `pending`/
+   `failed` 的组，整组删除其批次行与已落盘的部分 Parquet，再清理临时文件和
+   孤儿文件；没有任何半成品能进入查询快照，随后可重新上传
+   （`demo_recovery.py` 与 `test_startup_sweep_discards_interrupted_group_and_allows_reupload`）。
+
 ### 边界说明
 
 - 当前为**单容器/单进程**部署：引用计数与进程内写锁在进程内生效，SQLite 行锁
   提供持久化的合并互斥。多副本水平扩展需把文件存储换成 S3 之类共享存储、把
   引用计数与锁迁移到数据库/Redis，本仓库未包含该拓扑。
 - 单文件上传大小受 `RAIN_MAX_UPLOAD_BYTES` 限制（默认 50 MiB）。
+- 旧版本的 SQLite 元数据库在启动时自动迁移：重建 `batches` 表以加入
+  `group_id` 列和 `pending` 状态，并新建 `upload_groups` 表；既有已发布数据
+  原样保留，迁移幂等、可重复执行。
 
 ## 环境变量
 

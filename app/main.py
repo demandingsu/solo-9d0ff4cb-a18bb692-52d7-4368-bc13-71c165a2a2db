@@ -25,6 +25,24 @@ class BatchResponse(BaseModel):
     is_merged: bool
 
 
+class JointStationResult(BaseModel):
+    station_id: str
+    batch_id: str
+    day: str
+    row_count: int
+    size_bytes: int
+    content_sha256: str
+    status: str
+    is_merged: bool
+
+
+class JointUploadResponse(BaseModel):
+    group_id: str
+    day: str
+    station_count: int
+    stations: List[JointStationResult]
+
+
 class MergeResponse(BaseModel):
     merged_batch_id: str
     station_id: str
@@ -138,6 +156,37 @@ async def upload_batch(
         )
     result = services.upload_csv(station_id, day, content)
     return BatchResponse(**result)
+
+
+@app.post(
+    "/days/{day}/joint-batches",
+    response_model=JointUploadResponse,
+    status_code=201,
+    tags=["upload"],
+    summary="Atomic joint upload of one CSV covering 2-10 stations",
+)
+async def upload_joint_batch(
+    day: str = DAY_PATH,
+    file: UploadFile = File(
+        ...,
+        description=(
+            "One CSV for a single UTC day containing rows for 2-10 distinct "
+            "station_id values; each station needs at least one row. Every "
+            "station is stored as its own Parquet batch and the whole group "
+            "becomes visible in a single publication step."
+        ),
+    ),
+) -> JointUploadResponse:
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="uploaded file is empty")
+    if len(content) > settings.max_upload_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"file exceeds {settings.max_upload_bytes} bytes",
+        )
+    result = services.upload_joint_csv(day, content)
+    return JointUploadResponse(**result)
 
 
 @app.get(

@@ -219,6 +219,11 @@ class FileManager:
     def startup_sweep(self) -> dict[str, list[str]]:
         """Clean leftovers from a previous process.
 
+        * joint upload groups left ``pending`` by a crash (or marked
+          ``failed``) are removed as one unit – their metadata rows and any
+          partially written Parquet files – so no station of an unfinished
+          joint batch can ever appear published, and the same CSV can be
+          uploaded again;
         * temp files from a crashed upload/merge are removed (never published,
           therefore never queryable);
         * Parquet files without a metadata row are removed (half-finished
@@ -227,6 +232,42 @@ class FileManager:
         """
         removed_tmp: list[str] = []
         removed_orphans: list[str] = []
+        removed_groups: list[str] = []
+
+        # Recover interrupted joint uploads first: a group that never reached
+        # its publish commit must disappear completely before anyone queries.
+        conn = db.connect()
+        try:
+            stale_groups = [
+                r["group_id"]
+                for r in conn.execute(
+                    "SELECT group_id FROM upload_groups "
+                    "WHERE status IN ('pending', 'failed')"
+                ).fetchall()
+            ]
+            stale_files = [
+                r["file_path"]
+                for r in conn.execute(
+                    "SELECT file_path FROM batches "
+                    "WHERE status = 'pending' AND file_path != ''"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
+        for path_str in stale_files:
+            Path(path_str).unlink(missing_ok=True)
+        if stale_groups:
+            with db.transaction() as tx:
+                tx.executemany(
+                    "DELETE FROM batches WHERE group_id = ?",
+                    [(gid,) for gid in stale_groups],
+                )
+                tx.executemany(
+                    "DELETE FROM upload_groups WHERE group_id = ?",
+                    [(gid,) for gid in stale_groups],
+                )
+            removed_groups = stale_groups
 
         if self.tmp_dir.exists():
             for tmp in self.tmp_dir.glob("*.tmp-*"):
@@ -237,7 +278,9 @@ class FileManager:
         try:
             known = {
                 Path(r["file_path"]).resolve()
-                for r in conn.execute("SELECT file_path FROM batches").fetchall()
+                for r in conn.execute(
+                    "SELECT file_path FROM batches WHERE file_path != ''"
+                ).fetchall()
             }
         finally:
             conn.close()
@@ -251,7 +294,11 @@ class FileManager:
         with db.transaction() as tx:
             tx.execute("DELETE FROM merge_locks")
 
-        return {"temp_files": removed_tmp, "orphan_parquet": removed_orphans}
+        return {
+            "temp_files": removed_tmp,
+            "orphan_parquet": removed_orphans,
+            "interrupted_joint_groups": removed_groups,
+        }
 
 
 file_manager = FileManager()
